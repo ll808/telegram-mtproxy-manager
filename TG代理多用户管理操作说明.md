@@ -311,7 +311,7 @@ journalctl -u telemt -n 200 --no-pager
 
 ```bash
 ls -ld /etc/telemt /etc/telemt/backups
-ls -l /etc/telemt/telemt.toml
+ls -l /etc/telemt/telemt.toml /etc/telemt/api.token
 ```
 
 配置文件和备份应为 `600`，目录应为 root 可访问的受限目录。
