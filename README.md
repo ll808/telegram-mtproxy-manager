@@ -32,7 +32,7 @@ sudo bash install.sh --port 443 --domain www.bing.com
 从 GitHub 一行安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ll808/telegram-mtproxy-manager/main/install.sh | sudo bash -s -- --port 443 --domain www.bing.com
+curl -fsSL https://raw.githubusercontent.com/ll808/telegram-mtproxy-manager/v1.0.0/install.sh | sudo bash -s -- --port 443 --domain www.bing.com
 ```
 
 如果 443 已被占用：
