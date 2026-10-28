@@ -17,7 +17,7 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| VPS 公网 IPv4 | `23.94.208.42` |
+| VPS 公网 IPv4 | 安装时自动识别，可用 `tgctl status` 查看 |
 | 操作系统 | Ubuntu 22.04 |
 | 代理后端 | Telemt 3.5.14 |
 | MTProto 端口 | `2053/TCP` |
@@ -35,7 +35,7 @@
 
 ## 系统结构
 
-客户端连接 `23.94.208.42:2053`，使用与用户对应的 FakeTLS secret。Telemt 验证
+客户端连接 `VPS_PUBLIC_IP:2053`，使用与用户对应的 FakeTLS secret。Telemt 验证
 连接并转发至 Telegram。管理操作通过本机 API 完成，公网不开放管理端口。
 
 管理员使用 `tgctl` 发出本地 API 请求。请求必须携带 `/etc/telemt/api.token` 中的
