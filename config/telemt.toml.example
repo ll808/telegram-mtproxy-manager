@@ -1,0 +1,39 @@
+# 示例配置。真实 secret 和 API 令牌由 install.sh 在本机随机生成。
+[general]
+use_middle_proxy = true
+log_level = "normal"
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[general.links]
+show = []
+public_host = "203.0.113.10"
+public_port = 443
+
+[server]
+port = 443
+
+[server.api]
+enabled = true
+listen = "127.0.0.1:19091"
+whitelist = ["127.0.0.1/32", "::1/128"]
+auth_header = "Bearer REPLACE_WITH_RANDOM_API_TOKEN"
+request_body_limit_bytes = 65536
+minimal_runtime_enabled = false
+gray_action = "drop"
+
+[[server.listeners]]
+ip = "0.0.0.0"
+port = 443
+
+[censorship]
+tls_domain = "www.bing.com"
+mask = true
+tls_emulation = true
+tls_front_dir = "/opt/telemt/tlsfront"
+
+[access.users]
+owner = "REPLACE_WITH_32_HEX_CHARACTERS"

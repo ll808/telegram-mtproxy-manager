@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly API_BASE="http://127.0.0.1:19091"
+readonly API_TOKEN_FILE="/etc/telemt/api.token"
+readonly CONFIG_FILE="/etc/telemt/telemt.toml"
+readonly SERVICE_NAME="telemt"
+readonly BACKUP_DIR="/etc/telemt/backups"
+readonly BACKUP_RETENTION=5
+
+die() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+require_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    die "请使用 root 运行，例如：sudo tgctl"
+  fi
+}
+
+require_tools() {
+  local command_name
+  for command_name in curl jq systemctl ss; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      die "缺少命令：${command_name}"
+    fi
+  done
+}
+
+validate_username() {
+  local username=$1
+  if [[ ! $username =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+    die "用户名只能包含字母、数字、点、下划线和短横线，长度为 1 到 64"
+  fi
+}
+
+api_call() {
+  local method=$1
+  local path=$2
+  local data=${3:-}
+  local output header_file http_code error_message api_token
+  local curl_args
+
+  if [[ ! -r $API_TOKEN_FILE ]] || [[ ! -s $API_TOKEN_FILE ]]; then
+    die "缺少管理 API 令牌：${API_TOKEN_FILE}"
+  fi
+
+  output=$(mktemp)
+  header_file=$(mktemp)
+  chmod 0600 "$output" "$header_file"
+  api_token=$(<"$API_TOKEN_FILE")
+  printf 'Authorization: Bearer %s\n' "$api_token" >"$header_file"
+  curl_args=(-sS --max-time 10 -o "$output" -w '%{http_code}' -X "$method")
+  curl_args+=(-H "@${header_file}")
+  if [[ -n $data ]]; then
+    curl_args+=(-H 'Content-Type: application/json' --data "$data")
+  fi
+
+  if ! http_code=$(curl "${curl_args[@]}" "${API_BASE}${path}"); then
+    rm -f "$output" "$header_file"
+    die "无法连接 Telemt 管理 API，请检查 systemctl status telemt"
+  fi
+
+  if [[ ! $http_code =~ ^2[0-9][0-9]$ ]]; then
+    error_message=$(jq -r '.error.message // .error.code // .' "$output" 2>/dev/null || true)
+    rm -f "$output" "$header_file"
+    die "管理 API 返回 HTTP ${http_code}：${error_message:-未知错误}"
+  fi
+
+  cat "$output"
+  rm -f "$output" "$header_file"
+}
+
+service_is_active() {
+  systemctl is-active --quiet "$SERVICE_NAME"
+}
+
+port_is_listening() {
+  local port=$1
+  ss -H -ltn 2>/dev/null |
+    awk '{print $4}' |
+    grep -Eq "[:.]${port}$"
+}
+
+current_public_port() {
+  api_call GET /v1/config |
+    jq -r '
+      .data.general.links.public_port //
+      .data.server.listeners[0].port //
+      empty
+    '
+}
+
+show_status() {
+  local port user_count
+  local users_json
+
+  printf '\nTelemt 状态\n'
+  printf '服务：'
+  if service_is_active; then
+    printf '运行中\n'
+  else
+    printf '已停止\n'
+  fi
+
+  if port=$(current_public_port 2>/dev/null) && [[ -n $port ]]; then
+    printf '对外端口：%s（%s）\n' "$port" "$(
+      if port_is_listening "$port"; then
+        printf '正在监听'
+      else
+        printf '未监听'
+      fi
+    )"
+  else
+    printf '对外端口：管理 API 暂不可用\n'
+  fi
+
+  if users_json=$(api_call GET /v1/users 2>/dev/null); then
+    user_count=$(jq -r '.data | length' <<<"$users_json")
+    printf '用户数量：%s\n' "$user_count"
+  else
+    printf '用户数量：管理 API 暂不可用\n'
+  fi
+
+  printf '版本：'
+  telemt --version 2>/dev/null || printf '未知\n'
+}
+
+list_users() {
+  local users_json
+  local username enabled connections total_mib
+
+  users_json=$(api_call GET /v1/users)
+  printf '\n%-24s %-8s %-10s %-12s\n' '用户名' '状态' '连接数' '累计 MiB'
+  printf '%s\n' '----------------------------------------------------------------'
+
+  while IFS=$'\t' read -r username enabled connections total_mib; do
+    printf '%-24s %-8s %-10s %-12s\n' \
+      "$username" "$enabled" "$connections" "$total_mib"
+  done < <(
+    jq -r '
+      .data[] |
+      [
+        .username,
+        (if .enabled then "启用" else "停用" end),
+        (.current_connections | tostring),
+        (((.total_octets // 0) / 1048576 * 100 | floor) / 100 | tostring)
+      ] |
+      @tsv
+    ' <<<"$users_json"
+  )
+}
+
+show_user_links() {
+  local username=${1:-}
+  local users_json
+
+  if [[ -n $username ]]; then
+    validate_username "$username"
+    users_json=$(api_call GET "/v1/users/${username}")
+    jq -r '
+      .data as $user |
+      "[\($user.username)] \(if $user.enabled then "启用" else "停用" end)",
+      ($user.links.tls[]? | "FakeTLS：\(.)"),
+      ($user.links.secure[]? | "Secure：\(.)"),
+      ($user.links.classic[]? | "Classic：\(.)")
+    ' <<<"$users_json"
+  else
+    users_json=$(api_call GET /v1/users)
+    jq -r '
+      .data[] |
+      .username as $name |
+      "[\($name)]",
+      (.links.tls[]? | "FakeTLS：\(.)"),
+      (.links.secure[]? | "Secure：\(.)"),
+      (.links.classic[]? | "Classic：\(.)"),
+      ""
+    ' <<<"$users_json"
+  fi
+}
+
+create_user() {
+  local username=${1:-}
+  local payload response
+
+  if [[ -z $username ]]; then
+    read -r -p '新用户名：' username
+  fi
+  validate_username "$username"
+
+  payload=$(jq -nc --arg username "$username" '{username: $username}')
+  response=$(api_call POST /v1/users "$payload")
+  printf '用户 %s 已创建。\n' "$username"
+  jq -r '
+    (.data.user // .user) as $user |
+    ($user.links.tls[]? | "FakeTLS：\(.)")
+  ' <<<"$response"
+}
+
+rotate_user() {
+  local username=${1:-}
+  local response
+
+  if [[ -z $username ]]; then
+    read -r -p '要轮换认证的用户名：' username
+  fi
+  validate_username "$username"
+
+  response=$(api_call POST "/v1/users/${username}/rotate-secret")
+  printf '用户 %s 的旧认证已失效，新链接如下：\n' "$username"
+  jq -r '
+    (.data.user // .user) as $user |
+    ($user.links.tls[]? | "FakeTLS：\(.)")
+  ' <<<"$response"
+}
+
+set_user_enabled() {
+  local username=${1:-}
+  local action=${2:-}
+  local api_action response
+
+  if [[ -z $username ]]; then
+    read -r -p '用户名：' username
+  fi
+  validate_username "$username"
+
+  if [[ -z $action ]]; then
+    read -r -p '输入 enable 启用，输入 disable 停用：' action
+  fi
+
+  case "$action" in
+    enable|disable)
+      api_action=$action
+      ;;
+    *)
+      die "动作必须是 enable 或 disable"
+      ;;
+  esac
+
+  response=$(api_call POST "/v1/users/${username}/${api_action}")
+  jq -e '.ok == true' >/dev/null <<<"$response"
+  printf '用户 %s 已%s。\n' \
+    "$username" "$([[ $api_action == enable ]] && printf '启用' || printf '停用')"
+}
+
+delete_user() {
+  local username=${1:-}
+  local confirmation response
+
+  if [[ -z $username ]]; then
+    read -r -p '要删除的用户名：' username
+  fi
+  validate_username "$username"
+
+  if [[ $username == owner ]]; then
+    read -r -p 'owner 是当前主用户，仍要删除请输入 DELETE：' confirmation
+    [[ $confirmation == DELETE ]] || { printf '已取消。\n'; return 0; }
+  else
+    read -r -p "确认删除用户 ${username}？输入 yes：" confirmation
+    [[ $confirmation == yes ]] || { printf '已取消。\n'; return 0; }
+  fi
+
+  response=$(api_call DELETE "/v1/users/${username}")
+  jq -e '.ok == true' >/dev/null <<<"$response"
+  printf '用户 %s 已删除，活动会话已撤销。\n' "$username"
+}
+
+prune_backups() {
+  local backups=()
+  local index
+
+  [[ -d $BACKUP_DIR ]] || return 0
+  mapfile -t backups < <(
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name 'telemt.*.toml' -printf '%T@ %p\n' |
+      sort -nr |
+      cut -d' ' -f2-
+  )
+
+  for ((index = BACKUP_RETENTION; index < ${#backups[@]}; index++)); do
+    rm -f -- "${backups[index]}"
+  done
+}
+
+change_port() {
+  local new_port=${1:-}
+  local old_port payload response backup success=0
+
+  if [[ -z $new_port ]]; then
+    read -r -p '新的 TCP 端口（1024-65535）：' new_port
+  fi
+
+  if [[ ! $new_port =~ ^[0-9]+$ ]] ||
+     (( new_port < 1024 || new_port > 65535 )); then
+    die "端口必须是 1024 到 65535 之间的整数"
+  fi
+
+  old_port=$(current_public_port)
+  if [[ $new_port == "$old_port" ]]; then
+    printf '当前已经使用端口 %s。\n' "$new_port"
+    return 0
+  fi
+
+  if port_is_listening "$new_port"; then
+    die "端口 ${new_port} 已被其他程序占用"
+  fi
+
+  install -d -m 0700 "$BACKUP_DIR"
+  backup="${BACKUP_DIR}/telemt.$(date +%Y%m%d-%H%M%S).toml"
+  cp -a "$CONFIG_FILE" "$backup"
+  chmod 0600 "$backup"
+
+  payload=$(jq -nc \
+    --argjson port "$new_port" \
+    '{
+      server: {listeners: [{ip: "0.0.0.0", port: $port}]},
+      general: {links: {public_port: $port}}
+    }')
+
+  if ! response=$(api_call PATCH /v1/config "$payload"); then
+    die "端口配置未写入，服务保持原端口 ${old_port}"
+  fi
+  jq -e '.ok == true' >/dev/null <<<"$response"
+
+  if command -v ufw >/dev/null 2>&1 &&
+     ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${new_port}/tcp" >/dev/null || true
+  fi
+
+  if ! systemctl restart "$SERVICE_NAME"; then
+    printf 'Telemt 重启命令失败，正在回滚到 %s……\n' "$old_port" >&2
+    cp -a "$backup" "$CONFIG_FILE"
+    chown telemt:telemt "$CONFIG_FILE"
+    chmod 0600 "$CONFIG_FILE"
+    systemctl restart "$SERVICE_NAME" || true
+    die "端口切换失败，已尝试恢复旧配置"
+  fi
+
+  for _ in {1..15}; do
+    if service_is_active && port_is_listening "$new_port"; then
+      success=1
+      break
+    fi
+    sleep 1
+  done
+
+  if (( success == 0 )); then
+    printf '新端口启动失败，正在回滚到 %s……\n' "$old_port" >&2
+    cp -a "$backup" "$CONFIG_FILE"
+    chown telemt:telemt "$CONFIG_FILE"
+    chmod 0600 "$CONFIG_FILE"
+    systemctl restart "$SERVICE_NAME" || true
+    prune_backups
+    die "端口切换失败，已尝试恢复旧配置"
+  fi
+
+  prune_backups
+  printf '端口已从 %s 切换到 %s。请同步更新所有客户端，并检查云厂商安全组。\n' \
+    "$old_port" "$new_port"
+  printf '配置备份：%s\n' "$backup"
+}
+
+restart_service() {
+  systemctl restart "$SERVICE_NAME"
+  if service_is_active; then
+    printf 'Telemt 已重启并正常运行。\n'
+  else
+    die "Telemt 重启失败，请检查日志"
+  fi
+}
+
+show_logs() {
+  local line_count=${1:-80}
+  if [[ ! $line_count =~ ^[0-9]+$ ]] || (( line_count < 1 || line_count > 10000 )); then
+    die "日志行数必须是 1 到 10000 之间的整数"
+  fi
+  journalctl -u "$SERVICE_NAME" -n "$line_count" --no-pager
+}
+
+show_help() {
+  cat <<'EOF'
+用法：
+  tgctl                         打开交互菜单
+  tgctl status                  查看服务、端口和用户状态
+  tgctl users                   列出用户
+  tgctl link [用户名]           显示用户连接链接
+  tgctl add <用户名>            新增用户并生成独立认证
+  tgctl rotate <用户名>         轮换该用户的认证
+  tgctl enable <用户名>         启用用户
+  tgctl disable <用户名>        停用用户并断开其活动会话
+  tgctl delete <用户名>         删除用户
+  tgctl port <端口>             修改代理端口
+  tgctl restart                 重启服务
+  tgctl logs [行数]             查看日志
+EOF
+}
+
+interactive_menu() {
+  local choice username action
+
+  while true; do
+    printf '\n========== Telegram 代理管理 ==========\n'
+    printf '1. 状态\n'
+    printf '2. 用户列表\n'
+    printf '3. 查看连接链接\n'
+    printf '4. 新增用户\n'
+    printf '5. 轮换用户认证\n'
+    printf '6. 启用/停用用户\n'
+    printf '7. 删除用户\n'
+    printf '8. 修改代理端口\n'
+    printf '9. 重启服务\n'
+    printf '10. 查看日志\n'
+    printf '0. 退出\n'
+    read -r -p '请选择：' choice
+
+    case "$choice" in
+      1) show_status ;;
+      2) list_users ;;
+      3)
+        read -r -p '用户名（留空显示全部）：' username
+        show_user_links "$username"
+        ;;
+      4) create_user ;;
+      5) rotate_user ;;
+      6)
+        read -r -p '用户名：' username
+        read -r -p '输入 enable 或 disable：' action
+        set_user_enabled "$username" "$action"
+        ;;
+      7) delete_user ;;
+      8) change_port ;;
+      9) restart_service ;;
+      10) show_logs ;;
+      0) return 0 ;;
+      *) printf '无效选项。\n' ;;
+    esac
+  done
+}
+
+main() {
+  require_root
+  require_tools
+
+  case "${1:-menu}" in
+    menu) interactive_menu ;;
+    status) show_status ;;
+    users) list_users ;;
+    link) show_user_links "${2:-}" ;;
+    add) create_user "${2:-}" ;;
+    rotate) rotate_user "${2:-}" ;;
+    enable) set_user_enabled "${2:-}" enable ;;
+    disable) set_user_enabled "${2:-}" disable ;;
+    delete) delete_user "${2:-}" ;;
+    port) change_port "${2:-}" ;;
+    restart) restart_service ;;
+    logs) show_logs "${2:-80}" ;;
+    help|-h|--help) show_help ;;
+    *)
+      show_help
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
