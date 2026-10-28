@@ -23,9 +23,6 @@
 
 ## 安装
 
-仓库首次上传后，将本文件中的 `OWNER/REPO` 替换为实际 GitHub 路径，并将
-`install.sh` 中的 `REPO_RAW_BASE` 同步替换。
-
 从本地项目目录安装：
 
 ```bash
@@ -35,7 +32,7 @@ sudo bash install.sh --port 443 --domain www.bing.com
 从 GitHub 一行安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install.sh | sudo bash -s -- --port 443 --domain www.bing.com
+curl -fsSL https://raw.githubusercontent.com/ll808/telegram-mtproxy-manager/main/install.sh | sudo bash -s -- --port 443 --domain www.bing.com
 ```
 
 如果 443 已被占用：

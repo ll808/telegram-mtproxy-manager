@@ -9,7 +9,7 @@ readonly DEFAULT_PORT="443"
 readonly DEFAULT_API_PORT="19091"
 readonly DEFAULT_DOMAIN="www.bing.com"
 readonly DEFAULT_USER="owner"
-readonly REPO_RAW_BASE="${TGCTL_REPO_RAW_BASE:-https://raw.githubusercontent.com/OWNER/telegram-mtproxy-manager/main}"
+readonly REPO_RAW_BASE="${TGCTL_REPO_RAW_BASE:-https://raw.githubusercontent.com/ll808/telegram-mtproxy-manager/main}"
 
 SCRIPT_DIR=""
 if [[ -n ${BASH_SOURCE[0]:-} ]] && [[ -f ${BASH_SOURCE[0]} ]]; then
